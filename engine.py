@@ -141,7 +141,7 @@ def dispatch_optimized(df, battery_kwh=2000):
 
     soc = 0.6 * battery_kwh
     res = {k: np.zeros(n) for k in
-           ["solar_used", "wind_used", "batt_dis", "diesel_load", "diesel", "soc", "unmet", "curtailed"]}
+           ["solar_used", "wind_used", "batt_dis", "batt_chg", "diesel_load", "diesel", "soc", "unmet", "curtailed"]}
 
     for i in range(n):
         cap = cap_eff[i]
@@ -154,6 +154,7 @@ def dispatch_optimized(df, battery_kwh=2000):
             room = max(0.0, cap * soc_max - soc)
             ch = min(surplus, max_p, room / eff)
             soc += ch * eff
+            res["batt_chg"][i] = ch
             res["curtailed"][i] = surplus - ch
             used = load[i]
             share = used / ren[i] if ren[i] > 0 else 0
@@ -177,6 +178,7 @@ def dispatch_optimized(df, battery_kwh=2000):
                     room = max(0.0, cap * soc_max - soc)
                     ch = min(extra, max_p, room / eff)
                     soc += ch * eff
+                    res["batt_chg"][i] = ch
         res["soc"][i] = soc / cap * 100
 
     out = pd.DataFrame(res, index=df.index)
@@ -283,3 +285,49 @@ def fetch_live_weather(lat, lon, solar_kw=600, wind_kw=400, past_days=14, foreca
     with urllib.request.urlopen(url, timeout=20) as r:
         js = json.loads(r.read().decode("utf-8"))
     return parse_open_meteo(js, solar_kw, wind_kw)
+
+
+# ------------------------------------------------ RECOMMENDATION (what to use NOW)
+def mode_label(o):
+    """Short text: which sources are supplying the load in this hour."""
+    parts = []
+    if o["solar_used"] > 5: parts.append("Solar")
+    if o["wind_used"] > 5: parts.append("Wind")
+    if o["batt_dis"] > 5: parts.append("Battery")
+    if o["diesel_load"] > 5: parts.append("Diesel")
+    return " + ".join(parts) if parts else "-"
+
+
+def recommendation(d, o):
+    """d = weather/load row, o = optimizer row. Returns (headline, list of reasons)."""
+    mix = mode_label(o)
+    diesel_txt = f"Diesel ON at {o['diesel']:.0f} kW" if o["diesel"] > 0 else "Diesel OFF"
+    headline = f"Use: {mix}  |  {diesel_txt}"
+
+    r = []
+    if d["sun"] < 0.02:
+        r.append("No usable sunlight, so solar is about 0 kW.")
+    else:
+        r.append(f"Sunlight available, so solar supplies {o['solar_used']:.0f} kW.")
+    ws = d["wind_speed"]
+    if ws < 3:
+        r.append(f"Wind is only {ws:.1f} m/s (below the 3 m/s start-up speed), so wind is about 0 kW.")
+    elif ws > 25:
+        r.append(f"Wind is {ws:.1f} m/s (above 25 m/s), so turbines shut down for safety.")
+    else:
+        r.append(f"Wind is {ws:.1f} m/s, so wind supplies {o['wind_used']:.0f} kW.")
+    if d["temp"] < -15:
+        r.append(f"Very cold ({d['temp']:.0f} C): heating demand is high and battery capacity "
+                 f"is reduced to about {float(battery_derate(d['temp']))*100:.0f}%.")
+    if o["batt_dis"] > 5:
+        r.append(f"Battery is discharging {o['batt_dis']:.0f} kW (charge level {o['soc']:.0f}%).")
+    elif o["batt_chg"] > 5:
+        r.append(f"Battery is charging {o['batt_chg']:.0f} kW from spare power (charge level {o['soc']:.0f}%).")
+    else:
+        r.append(f"Battery is idle (charge level {o['soc']:.0f}%).")
+    if o["diesel"] > 0:
+        r.append(f"Renewables and battery cannot cover the load ({d['load']:.0f} kW), so diesel "
+                 f"runs at {o['diesel']:.0f} kW (never below 30% of rating).")
+    else:
+        r.append("Renewables and battery cover the whole load, so diesel stays OFF and saves fuel.")
+    return headline, r
