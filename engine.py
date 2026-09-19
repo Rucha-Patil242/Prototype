@@ -196,3 +196,9 @@ def kpis(df, base_fuel, opt):
         "co2_t": (base_l - opt_l) * CO2_KG_PER_LITRE / 1000,
         "unmet_kwh": float(opt["unmet"].sum()),
     }
+
+def load_real_data(file):
+    df = pd.read_csv(file, parse_dates=["timestamp"], index_col="timestamp")
+    df = df.sort_index().resample("h").mean().interpolate()
+    df["hour"] = df.index.hour
+    return df
