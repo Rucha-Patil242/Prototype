@@ -235,3 +235,51 @@ def load_real_data(file, solar_kw=600, wind_kw=400):
         raise ValueError(f"Only {len(df)} hourly rows found. Need at least 120 (5 days); "
                          "download 2-4 weeks of data.")
     return df
+
+
+# ------------------------------------------------ LIVE WEATHER (Open-Meteo)
+STATIONS = {
+    "Bharati (Antarctica)": (-69.4, 76.2),
+    "Maitri (Antarctica)": (-70.8, 11.7),
+}
+
+
+def parse_open_meteo(js, solar_kw=600, wind_kw=400):
+    """Turn Open-Meteo JSON into the table the rest of the app uses.
+    Weather is REAL; solar, wind power and load are modelled from it."""
+    h = js["hourly"]
+    idx = pd.to_datetime(h["time"])
+    temp = pd.Series(h["temperature_2m"], index=idx, dtype="float").interpolate().bfill().ffill()
+    ws = pd.Series(h["wind_speed_10m"], index=idx, dtype="float").interpolate().bfill().ffill()
+    sw = pd.Series(h["shortwave_radiation"], index=idx, dtype="float").fillna(0)
+
+    df = pd.DataFrame(index=idx)
+    df["temp"] = temp
+    df["wind_speed"] = ws
+    df["sun"] = (sw / 1000.0).clip(0, 1)
+    cf = np.clip((ws - 3) / 9, 0, 1) ** 3
+    cf[ws > 25] = 0
+    hour = idx.hour.values
+    rng = np.random.default_rng(1)
+    df["solar"] = solar_kw * df["sun"]
+    df["wind"] = wind_kw * cf
+    base = 450 * (1 + 0.08 * np.sin((hour - 9) / 24 * 2 * np.pi))
+    df["load"] = base + 9.0 * np.clip(10 - temp, 0, None) + rng.normal(0, 25, len(df))
+    df["hour"] = hour
+    if len(df) < 120:
+        raise ValueError("Live weather returned too little data.")
+    return df
+
+
+def fetch_live_weather(lat, lon, solar_kw=600, wind_kw=400, past_days=14, forecast_days=2):
+    """Downloads recent + forecast hourly weather (free, no API key)."""
+    import json
+    import urllib.request
+    url = ("https://api.open-meteo.com/v1/forecast"
+           f"?latitude={lat}&longitude={lon}"
+           "&hourly=temperature_2m,wind_speed_10m,shortwave_radiation"
+           f"&past_days={past_days}&forecast_days={forecast_days}"
+           "&wind_speed_unit=ms&timezone=UTC")
+    with urllib.request.urlopen(url, timeout=20) as r:
+        js = json.loads(r.read().decode("utf-8"))
+    return parse_open_meteo(js, solar_kw, wind_kw)
