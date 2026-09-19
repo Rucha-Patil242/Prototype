@@ -197,8 +197,41 @@ def kpis(df, base_fuel, opt):
         "unmet_kwh": float(opt["unmet"].sum()),
     }
 
-def load_real_data(file):
-    df = pd.read_csv(file, parse_dates=["timestamp"], index_col="timestamp")
-    df = df.sort_index().resample("h").mean().interpolate()
+
+def load_real_data(file, solar_kw=600, wind_kw=400):
+    """Accepts EITHER a NASA POWER hourly CSV OR our own CSV
+    (timestamp,temp,wind_speed,sun,solar,wind,load)."""
+    raw = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    text = raw.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+    start = next((k for k, l in enumerate(lines) if l.startswith("YEAR")), None)
+
+    if start is not None:                       # ---- NASA POWER format
+        import io
+        d = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+        d = d.replace(-999, np.nan).replace(-999.0, np.nan)
+        d.index = pd.to_datetime(dict(year=d.YEAR, month=d.MO, day=d.DY, hour=d.HR))
+        df = pd.DataFrame(index=d.index)
+        df["temp"] = d["T2M"].interpolate().bfill().ffill()
+        df["wind_speed"] = d["WS10M"].interpolate().bfill().ffill()
+        irr = d["ALLSKY_SFC_SW_DWN"] if "ALLSKY_SFC_SW_DWN" in d else 0
+        df["sun"] = (irr / 1000.0).fillna(0).clip(0, 1)   # missing sun -> 0
+        # modelled station values from the REAL weather
+        rng = np.random.default_rng(1)
+        cf = np.clip((df["wind_speed"] - 3) / 9, 0, 1) ** 3
+        cf[df["wind_speed"] > 25] = 0
+        h = df.index.hour.values
+        df["solar"] = solar_kw * df["sun"]
+        df["wind"] = wind_kw * cf
+        base = 450 * (1 + 0.08 * np.sin((h - 9) / 24 * 2 * np.pi))
+        df["load"] = base + 9.0 * np.clip(10 - df["temp"], 0, None) + rng.normal(0, 25, len(df))
+    else:                                       # ---- our own CSV format
+        import io
+        df = pd.read_csv(io.StringIO(text), parse_dates=["timestamp"], index_col="timestamp")
+        df = df.sort_index().resample("h").mean().interpolate()
+
     df["hour"] = df.index.hour
+    if len(df) < 120:
+        raise ValueError(f"Only {len(df)} hourly rows found. Need at least 120 (5 days); "
+                         "download 2-4 weeks of data.")
     return df
