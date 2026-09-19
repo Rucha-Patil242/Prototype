@@ -25,7 +25,7 @@ st.sidebar.info("Change the scenario and watch fuel savings change live.")
 def run(scenario, solar_kw, wind_kw, batt_kwh, csv_bytes=None):
     import io
     if csv_bytes is not None:
-        df = E.load_real_data(io.BytesIO(csv_bytes))
+        df = E.load_real_data(io.BytesIO(csv_bytes), solar_kw, wind_kw)
     else:
         df = E.make_data(scenario, solar_kw=solar_kw, wind_kw=wind_kw)
     fc, metrics = E.forecast(df)
@@ -33,14 +33,21 @@ def run(scenario, solar_kw, wind_kw, batt_kwh, csv_bytes=None):
     opt = E.dispatch_optimized(df, batt_kwh)
     return df, fc, metrics, base_fuel, opt
 
-df, fc, metrics, base_fuel, opt = run(
-    scenario, solar_kw, wind_kw, batt_kwh,
-    uploaded.getvalue() if uploaded else None)
+try:
+    df, fc, metrics, base_fuel, opt = run(
+        scenario, solar_kw, wind_kw, batt_kwh,
+        uploaded.getvalue() if uploaded else None)
+except Exception as err:
+    st.error(f"Could not use the uploaded file: {err}")
+    st.stop()
+if uploaded:
+    st.success(f"Using uploaded data: {len(df)} hours ({len(df)//24} days), "
+               f"{df.index[0].date()} to {df.index[-1].date()}")
 k = E.kpis(df, base_fuel, opt)
 
 # ---------------------------------------------------------------------- KPIs
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("⛽ Fuel saved", f"{k['saved_pct']:.1f}%", f"{k['saved_l']:,.0f} litres / 30 days")
+c1.metric("⛽ Fuel saved", f"{k['saved_pct']:.1f}%", f"{k['saved_l']:,.0f} litres saved")
 c2.metric("🌬️ Renewable share", f"{k['ren_share']:.1f}%")
 c3.metric("🌍 CO₂ avoided", f"{k['co2_t']:.1f} tonnes")
 c4.metric("🔮 Load forecast error", f"{metrics['load_mape']:.1f}% MAPE",
@@ -91,7 +98,7 @@ with tab3:
                            y=[k["base_l"], k["opt_l"]],
                            marker_color=["#eb5757", "#27ae60"],
                            text=[f"{k['base_l']:,.0f} L", f"{k['opt_l']:,.0f} L"], textposition="auto"))
-    fig.update_layout(title="Diesel consumed over 30 days", yaxis_title="Litres", height=400)
+    fig.update_layout(title="Diesel consumed over the whole period", yaxis_title="Litres", height=400)
     st.plotly_chart(fig, use_container_width=True)
     st.success(f"AI dispatch saves **{k['saved_l']:,.0f} litres** ({k['saved_pct']:.1f}%) "
                f"and avoids **{k['co2_t']:.1f} t CO₂** in this scenario.")
