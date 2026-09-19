@@ -17,18 +17,25 @@ scenario = st.sidebar.selectbox("Polar condition", list(E.SCENARIOS.keys()))
 solar_kw = st.sidebar.slider("Solar capacity (kW)", 0, 1500, 600, 50)
 wind_kw = st.sidebar.slider("Wind capacity (kW)", 0, 1500, 400, 50)
 batt_kwh = st.sidebar.slider("Battery size (kWh)", 500, 6000, 2000, 250)
+uploaded = st.sidebar.file_uploader("Upload real data (CSV, optional)", type="csv")
 st.sidebar.info("Change the scenario and watch fuel savings change live.")
 
 # ------------------------------------------------------------------- Compute
 @st.cache_data
-def run(scenario, solar_kw, wind_kw, batt_kwh):
-    df = E.make_data(scenario, solar_kw=solar_kw, wind_kw=wind_kw)
+def run(scenario, solar_kw, wind_kw, batt_kwh, csv_bytes=None):
+    import io
+    if csv_bytes is not None:
+        df = E.load_real_data(io.BytesIO(csv_bytes))
+    else:
+        df = E.make_data(scenario, solar_kw=solar_kw, wind_kw=wind_kw)
     fc, metrics = E.forecast(df)
     base_fuel, base_p = E.dispatch_baseline(df)
     opt = E.dispatch_optimized(df, batt_kwh)
     return df, fc, metrics, base_fuel, opt
 
-df, fc, metrics, base_fuel, opt = run(scenario, solar_kw, wind_kw, batt_kwh)
+df, fc, metrics, base_fuel, opt = run(
+    scenario, solar_kw, wind_kw, batt_kwh,
+    uploaded.getvalue() if uploaded else None)
 k = E.kpis(df, base_fuel, opt)
 
 # ---------------------------------------------------------------------- KPIs
