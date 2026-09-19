@@ -18,31 +18,54 @@ solar_kw = st.sidebar.slider("Solar capacity (kW)", 0, 1500, 600, 50)
 wind_kw = st.sidebar.slider("Wind capacity (kW)", 0, 1500, 400, 50)
 batt_kwh = st.sidebar.slider("Battery size (kWh)", 500, 6000, 2000, 250)
 uploaded = st.sidebar.file_uploader("Upload real data (CSV, optional)", type="csv")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌐 Live weather")
+station = st.sidebar.selectbox("Station", list(E.STATIONS.keys()))
+if st.sidebar.button("Fetch live weather (Open-Meteo)"):
+    try:
+        lat, lon = E.STATIONS[station]
+        st.session_state["live_df"] = E.fetch_live_weather(lat, lon, solar_kw, wind_kw)
+        st.session_state["live_name"] = station
+        st.session_state["live_time"] = __import__("datetime").datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
+    except Exception as err:
+        st.sidebar.error(f"Could not fetch live weather: {err}. Use CSV upload or scenarios instead.")
+use_live = False
+if "live_df" in st.session_state:
+    use_live = st.sidebar.checkbox("Use live weather data", value=True)
 st.sidebar.info("Change the scenario and watch fuel savings change live.")
 
 # ------------------------------------------------------------------- Compute
 @st.cache_data
-def run(scenario, solar_kw, wind_kw, batt_kwh, csv_bytes=None):
+def get_df(scenario, solar_kw, wind_kw, csv_bytes=None):
     import io
     if csv_bytes is not None:
-        df = E.load_real_data(io.BytesIO(csv_bytes), solar_kw, wind_kw)
-    else:
-        df = E.make_data(scenario, solar_kw=solar_kw, wind_kw=wind_kw)
+        return E.load_real_data(io.BytesIO(csv_bytes), solar_kw, wind_kw)
+    return E.make_data(scenario, solar_kw=solar_kw, wind_kw=wind_kw)
+
+@st.cache_data
+def compute(df, batt_kwh):
     fc, metrics = E.forecast(df)
     base_fuel, base_p = E.dispatch_baseline(df)
     opt = E.dispatch_optimized(df, batt_kwh)
-    return df, fc, metrics, base_fuel, opt
+    return fc, metrics, base_fuel, opt
 
 try:
-    df, fc, metrics, base_fuel, opt = run(
-        scenario, solar_kw, wind_kw, batt_kwh,
-        uploaded.getvalue() if uploaded else None)
+    if uploaded:
+        df = get_df(scenario, solar_kw, wind_kw, uploaded.getvalue())
+        st.success(f"Using uploaded data: {len(df)} hours ({len(df)//24} days), "
+                   f"{df.index[0].date()} to {df.index[-1].date()}")
+    elif use_live:
+        df = st.session_state["live_df"]
+        st.success(f"🌐 LIVE weather for {st.session_state['live_name']} "
+                   f"(fetched {st.session_state['live_time']}): last 14 days + next 48 h forecast. "
+                   "Weather is real; solar, wind power and load are modelled from it.")
+    else:
+        df = get_df(scenario, solar_kw, wind_kw)
+    fc, metrics, base_fuel, opt = compute(df, batt_kwh)
 except Exception as err:
-    st.error(f"Could not use the uploaded file: {err}")
+    st.error(f"Could not process the data: {err}")
     st.stop()
-if uploaded:
-    st.success(f"Using uploaded data: {len(df)} hours ({len(df)//24} days), "
-               f"{df.index[0].date()} to {df.index[-1].date()}")
+
 k = E.kpis(df, base_fuel, opt)
 
 # ---------------------------------------------------------------------- KPIs
