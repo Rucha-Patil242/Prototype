@@ -4,6 +4,7 @@ Run with:  streamlit run app.py
 """
 import streamlit as st
 import plotly.graph_objects as go
+import pandas as pd
 import engine as E
 
 st.set_page_config(page_title="Polar Energy Manager", page_icon="🧊", layout="wide")
@@ -80,8 +81,35 @@ if k["unmet_kwh"] > 0:
     st.warning(f"⚠️ Generators can't cover the load in this scenario: {k['unmet_kwh']:,.0f} kWh unmet. "
                "Add more capacity/storage.")
 
+
+# ------------------------------------------- Recommendation: what to use NOW
+if use_live and not uploaded:
+    now_ts = pd.Timestamp.now(tz="UTC").tz_localize(None).floor("h")
+    pos = int(df.index.get_indexer([now_ts], method="nearest")[0])
+else:
+    pos = max(0, len(df) - 24)
+lo, hi = max(0, pos - 24), min(len(df) - 1, pos + 47)
+st.subheader("🎯 Recommended energy mix")
+i = st.select_slider("🕒 Choose the hour to inspect (default = current hour)",
+                     options=list(range(lo, hi + 1)), value=pos,
+                     format_func=lambda j: df.index[j].strftime("%d %b %H:%M") + " UTC")
+d_row, o_row = df.iloc[i], opt.iloc[i]
+headline, reasons = E.recommendation(d_row, o_row)
+st.success(f"**{df.index[i].strftime('%d %b %Y %H:%M')} UTC  ->  {headline}**")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("☀️ Solar", f"{o_row.solar_used:.0f} kW")
+m2.metric("🌬️ Wind", f"{o_row.wind_used:.0f} kW")
+m3.metric("🔋 Battery", f"{o_row.batt_dis - o_row.batt_chg:+.0f} kW",
+          "discharging" if o_row.batt_dis > o_row.batt_chg else "charging / idle", delta_color="off")
+m4.metric("⛽ Diesel", f"{o_row.diesel:.0f} kW")
+m5.metric("🏠 Station load", f"{d_row.load:.0f} kW")
+st.markdown("**Why:**")
+for r in reasons:
+    st.write("• " + r)
+st.caption("Based on live weather" if (use_live and not uploaded) else "Based on the selected data source")
+
 WINDOW = 72  # show last 72 hours in charts
-tab1, tab2, tab3 = st.tabs(["📈 Forecast", "⚡ Power mix & battery", "⛽ Baseline vs AI"])
+tab1, tab2, tab3, tab4 = st.tabs(["📈 Forecast", "⚡ Power mix & battery", "⛽ Baseline vs AI", "🗓️ Next 24 h schedule"])
 
 # --------------------------------------------------------------- Tab 1: Forecast
 with tab1:
@@ -125,6 +153,28 @@ with tab3:
     st.plotly_chart(fig, use_container_width=True)
     st.success(f"AI dispatch saves **{k['saved_l']:,.0f} litres** ({k['saved_pct']:.1f}%) "
                f"and avoids **{k['co2_t']:.1f} t CO₂** in this scenario.")
+
+
+# ------------------------------------------------- Tab 4: 24-hour schedule
+with tab4:
+    end = min(len(df), pos + 24)
+    sched = pd.DataFrame({
+        "Time (UTC)": df.index[pos:end].strftime("%d %b %H:%M"),
+        "Temp (C)": df["temp"].iloc[pos:end].round(1).values,
+        "Wind (m/s)": df["wind_speed"].iloc[pos:end].round(1).values,
+        "Load (kW)": df["load"].iloc[pos:end].round(0).values,
+        "Solar (kW)": opt["solar_used"].iloc[pos:end].round(0).values,
+        "Wind (kW)": opt["wind_used"].iloc[pos:end].round(0).values,
+        "Battery (kW, + discharge)": (opt["batt_dis"] - opt["batt_chg"]).iloc[pos:end].round(0).values,
+        "Diesel (kW)": opt["diesel"].iloc[pos:end].round(0).values,
+        "Battery charge %": opt["soc"].iloc[pos:end].round(0).values,
+        "Recommended source": opt.iloc[pos:end].apply(E.mode_label, axis=1).values,
+    })
+    st.write("Recommended energy source for each of the next 24 hours:")
+    st.dataframe(sched, use_container_width=True, hide_index=True)
+    st.download_button("Download schedule (CSV)", sched.to_csv(index=False), "dispatch_schedule.csv", "text/csv")
+    st.caption("Future hours use forecast weather; station load is modelled from temperature. "
+               "With real SCADA data, this table would drive generator and battery setpoints.")
 
 with st.expander("ℹ️ How it works"):
     st.markdown("""
