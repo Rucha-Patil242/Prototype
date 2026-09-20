@@ -81,8 +81,8 @@ def forecast(df):
     split = int(len(d) * 0.8)
     train, test = d.iloc[:split], d.iloc[split:]
 
-    load_feats = ["hour", "temp", "wind_speed", "load_lag1", "load_lag24"]
-    ren_feats = ["hour", "temp", "wind_speed", "sun", "ren_lag1"]
+    load_feats = ["hour", "temp", "wind_speed", "load_lag24"]
+    ren_feats = ["hour", "temp", "wind_speed", "sun"]
 
     m_load = GradientBoostingRegressor(n_estimators=150, max_depth=3, random_state=0)
     m_ren = GradientBoostingRegressor(n_estimators=150, max_depth=3, random_state=0)
@@ -170,6 +170,12 @@ def dispatch_optimized(df, battery_kwh=2000):
             rem = net - dis
             if rem > 0:
                 d = min(max(rem, DIESEL_MIN_FRAC * DIESEL_RATED_KW), DIESEL_RATED_KW)
+                give = min(dis, max(0.0, d - rem)) if dis > 0 else 0.0   # spare diesel power replaces battery output
+                if give > 0:
+                    soc += give / eff
+                    dis -= give
+                    rem += give
+                    res["batt_dis"][i] = dis
                 res["diesel"][i] = d
                 res["diesel_load"][i] = min(rem, d)
                 res["unmet"][i] = max(0.0, rem - d)
@@ -325,9 +331,115 @@ def recommendation(d, o):
         r.append(f"Battery is charging {o['batt_chg']:.0f} kW from spare power (charge level {o['soc']:.0f}%).")
     else:
         r.append(f"Battery is idle (charge level {o['soc']:.0f}%).")
+    if o["diesel"] > 0 and o["batt_chg"] > 5 and o.get("need_kwh", 0) > 0:
+        r.append(f"Forecast shows about {o['need_kwh']:.0f} kWh of shortfall in the next 12 h, so diesel "
+                 "runs harder now to fill the battery and can then switch OFF and coast.")
     if o["diesel"] > 0:
         r.append(f"Renewables and battery cannot cover the load ({d['load']:.0f} kW), so diesel "
                  f"runs at {o['diesel']:.0f} kW (never below 30% of rating).")
     else:
         r.append("Renewables and battery cover the whole load, so diesel stays OFF and saves fuel.")
     return headline, r
+
+
+# ------------------------------------------ FORECAST-DRIVEN DISPATCH (AI + optimizer)
+def forecast_all(df, folds=4):
+    """Out-of-sample forecast for EVERY hour (blocked cross-validation).
+    Each block is predicted by a model that never saw that block."""
+    d = df.copy()
+    d["ren"] = d["solar"] + d["wind"]
+    d["load_lag24"] = d["load"].shift(24).bfill()
+    lf = ["hour", "temp", "wind_speed", "load_lag24"]
+    rf = ["hour", "temp", "wind_speed", "sun"]
+    n = len(d)
+    edges = np.linspace(0, n, folds + 1).astype(int)
+    load_pred, ren_pred = np.zeros(n), np.zeros(n)
+    for f in range(folds):
+        a, b = edges[f], edges[f + 1]
+        tr = np.r_[0:a, b:n]
+        ml = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=0)
+        mr = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=0)
+        ml.fit(d.iloc[tr][lf], d.iloc[tr]["load"])
+        mr.fit(d.iloc[tr][rf], d.iloc[tr]["ren"])
+        load_pred[a:b] = ml.predict(d.iloc[a:b][lf])
+        ren_pred[a:b] = np.clip(mr.predict(d.iloc[a:b][rf]), 0, None)
+    return pd.DataFrame({"load_pred": load_pred, "ren_pred": ren_pred}, index=df.index)
+
+
+def dispatch_forecast_driven(df, fc, battery_kwh=2000, horizon=12):
+    """Look-ahead dispatch. Each hour the controller reads the forecast for the next
+    `horizon` hours, works out how much battery energy will be needed, and when diesel
+    MUST run it runs harder (efficient) to fill the battery, then switches off and coasts."""
+    n = len(df)
+    load, solar, wind = df["load"].values, df["solar"].values, df["wind"].values
+    ren = solar + wind
+    net_f = fc["load_pred"].values - fc["ren_pred"].values   # forecast deficit (kW)
+    cap_eff = battery_kwh * battery_derate(df["temp"].values)
+    eff, soc_min, soc_max = 0.92, 0.20, 0.95
+    min_load = DIESEL_MIN_FRAC * DIESEL_RATED_KW
+
+    soc = 0.6 * battery_kwh
+    res = {k: np.zeros(n) for k in ["solar_used", "wind_used", "batt_dis", "batt_chg",
+                                    "diesel_load", "diesel", "soc", "unmet", "curtailed", "need_kwh"]}
+    for i in range(n):
+        cap = cap_eff[i]
+        max_p = 0.5 * cap
+        soc = min(soc, cap * soc_max)
+        net = load[i] - ren[i]
+
+        # --- look-ahead: peak cumulative forecast deficit over the next hours
+        fut = net_f[i + 1: i + 1 + horizon]
+        need = max(0.0, float(np.cumsum(fut).max())) if len(fut) else 0.0
+        res["need_kwh"][i] = need
+
+        if net <= 0:                                     # surplus renewables -> charge
+            surplus = -net
+            room = max(0.0, cap * soc_max - soc)
+            ch = min(surplus, max_p, room / eff)
+            soc += ch * eff
+            res["batt_chg"][i] = ch
+            res["curtailed"][i] = surplus - ch
+            share = load[i] / ren[i] if ren[i] > 0 else 0
+            res["solar_used"][i] = solar[i] * share
+            res["wind_used"][i] = wind[i] * share
+        else:                                            # deficit
+            res["solar_used"][i] = solar[i]
+            res["wind_used"][i] = wind[i]
+            avail = max(0.0, soc - cap * soc_min)
+            dis = min(net, max_p, avail * eff)
+            soc -= dis / eff
+            res["batt_dis"][i] = dis
+            rem = net - dis
+            if rem > 0:                                  # diesel has to run
+                # Only pre-charge if the battery could later carry the load by itself
+                # (otherwise diesel runs anyway and charging just wastes energy in losses)
+                mean_def = float(np.mean(np.maximum(fut, 0))) if len(fut) else 0.0
+                can_bridge = mean_def <= 0.9 * max_p
+                target = min(cap * soc_max, cap * soc_min + 1.1 * need / eff)
+                want_ch = min(max_p, max(0.0, (target - soc) / eff)) if can_bridge else 0.0
+                if want_ch > 0 and dis > 0:      # never discharge and charge in the same hour
+                    soc += dis / eff
+                    res["batt_dis"][i] = 0.0
+                    rem, dis = net, 0.0
+                    want_ch = min(max_p, max(0.0, (target - soc) / eff))
+                d = min(max(rem + want_ch, min_load), DIESEL_RATED_KW)
+                give = min(dis, max(0.0, d - rem)) if dis > 0 else 0.0   # spare diesel power replaces battery output
+                if give > 0:
+                    soc += give / eff
+                    dis -= give
+                    rem += give
+                    res["batt_dis"][i] = dis
+                res["diesel"][i] = d
+                res["diesel_load"][i] = min(rem, d)
+                res["unmet"][i] = max(0.0, rem - d)
+                extra = d - rem
+                if extra > 0:
+                    room = max(0.0, cap * soc_max - soc)
+                    ch = min(extra, max_p, room / eff)
+                    soc += ch * eff
+                    res["batt_chg"][i] = ch
+        res["soc"][i] = soc / cap * 100
+
+    out = pd.DataFrame(res, index=df.index)
+    out["fuel_l"] = fuel_litres(out["diesel"].values)
+    return out
