@@ -45,10 +45,12 @@ def get_df(scenario, solar_kw, wind_kw, csv_bytes=None):
 
 @st.cache_data
 def compute(df, batt_kwh):
-    fc, metrics = E.forecast(df)
-    base_fuel, base_p = E.dispatch_baseline(df)
-    opt = E.dispatch_optimized(df, batt_kwh)
-    return fc, metrics, base_fuel, opt
+    fc, metrics = E.forecast(df)                       # accuracy on unseen test data
+    fc_all = E.forecast_all(df)                        # out-of-sample forecast for every hour
+    base_fuel, base_p = E.dispatch_baseline(df)        # 1) diesel only
+    opt_reactive = E.dispatch_optimized(df, batt_kwh)  # 2) reactive rules (no forecast)
+    opt = E.dispatch_forecast_driven(df, fc_all, batt_kwh)  # 3) AI forecast-driven
+    return fc, metrics, base_fuel, opt, opt_reactive
 
 try:
     if uploaded:
@@ -62,7 +64,7 @@ try:
                    "Weather is real; solar, wind power and load are modelled from it.")
     else:
         df = get_df(scenario, solar_kw, wind_kw)
-    fc, metrics, base_fuel, opt = compute(df, batt_kwh)
+    fc, metrics, base_fuel, opt, opt_reactive = compute(df, batt_kwh)
 except Exception as err:
     st.error(f"Could not process the data: {err}")
     st.stop()
@@ -145,15 +147,22 @@ with tab2:
 
 # ------------------------------------------------------- Tab 3: Baseline vs AI
 with tab3:
-    fig = go.Figure(go.Bar(x=["Diesel-only (baseline)", "AI-optimized"],
-                           y=[k["base_l"], k["opt_l"]],
-                           marker_color=["#eb5757", "#27ae60"],
-                           text=[f"{k['base_l']:,.0f} L", f"{k['opt_l']:,.0f} L"], textposition="auto"))
-    fig.update_layout(title="Diesel consumed over the whole period", yaxis_title="Litres", height=400)
+    reactive_l = float(opt_reactive["fuel_l"].sum())
+    ai_l = k["opt_l"]
+    extra_pct = (reactive_l - ai_l) / reactive_l * 100 if reactive_l > 0 else 0
+    fig = go.Figure(go.Bar(
+        x=["1. Diesel-only", "2. Reactive rules (no forecast)", "3. AI forecast-driven"],
+        y=[k["base_l"], reactive_l, ai_l],
+        marker_color=["#eb5757", "#f2c94c", "#27ae60"],
+        text=[f"{k['base_l']:,.0f} L", f"{reactive_l:,.0f} L", f"{ai_l:,.0f} L"], textposition="auto"))
+    fig.update_layout(title="Diesel consumed over the whole period", yaxis_title="Litres", height=420)
     st.plotly_chart(fig, use_container_width=True)
-    st.success(f"AI dispatch saves **{k['saved_l']:,.0f} litres** ({k['saved_pct']:.1f}%) "
-               f"and avoids **{k['co2_t']:.1f} t CO₂** in this scenario.")
-
+    st.success(f"AI forecast-driven dispatch saves **{k['saved_l']:,.0f} litres** ({k['saved_pct']:.1f}%) "
+               f"vs diesel-only and avoids **{k['co2_t']:.1f} t CO₂**.")
+    st.info(f"Value of the AI forecast alone: **{extra_pct:.1f}% less diesel** than reactive rules "
+            f"({reactive_l - ai_l:,.0f} litres).")
+    st.caption("Forecasts for each hour come from a model that never saw that hour (blocked cross-validation). "
+               "Small differences in final battery charge between strategies are not adjusted for.")
 
 # ------------------------------------------------- Tab 4: 24-hour schedule
 with tab4:
@@ -178,9 +187,11 @@ with tab4:
 
 with st.expander("ℹ️ How it works"):
     st.markdown("""
-1. **Data**: hourly temperature, wind, sun, and load (simulated; replace with real SCADA/weather data).
-2. **Forecast**: Gradient Boosting model predicts load and renewable output from weather + recent history.
-3. **Optimize**: each hour, use renewables first, then battery (capacity reduced in cold), then diesel.
-   Generators never run below 30% load (inefficient).
-4. **Compare**: against a diesel-only baseline to show fuel and CO₂ savings.
+1. **Data**: hourly temperature, wind, sun and load (simulated, NASA POWER, or live Open-Meteo weather).
+2. **Forecast**: Gradient Boosting predicts load and renewable output for every hour from the weather and yesterday's load.
+3. **Look-ahead dispatch**: each hour the controller reads the forecast for the next 12 hours and estimates how much
+   battery energy will be needed. Renewables are used first, then the battery (cold-derated, 20% reserve).
+   When diesel *must* run, it runs harder (generators are more efficient at high load) to fill the battery,
+   then switches OFF and lets the battery carry the load. It does this only when the battery could really take over.
+4. **Compare**: diesel-only vs reactive rules vs AI forecast-driven, so the value of the forecast is measured.
 """)
