@@ -2,7 +2,7 @@
 
 AI-based energy management system for polar research stations: load forecasting, renewable integration and fuel optimization.
 
-**SIH Problem Statement ID:** 61
+**SIH Problem Statement ID:** 26061
 **Team:** <team name> | <member names>
 **Live demo:** <Streamlit link>
 **Demo video:** <video link>
